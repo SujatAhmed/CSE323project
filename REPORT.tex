@@ -1,0 +1,329 @@
+\documentclass[12pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{titlesec}
+\usepackage{parskip}
+\usepackage{microtype}
+
+\geometry{margin=1in}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue
+}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    backgroundcolor=\color{gray!10},
+    frame=single,
+    breaklines=true,
+    showstringspaces=false
+}
+
+\title{
+    \textbf{ElemOS --- Technical Report} \\[0.5em]
+    \large CSE323 --- Operating Systems
+}
+\author{
+    Kazi Sujat Ahmed Sazid \\
+    ID: 2231177642
+}
+\date{}
+
+\begin{document}
+
+\maketitle
+\thispagestyle{empty}
+\vspace{0.5em}
+\noindent\textbf{Project:} ElemOS, a 64-bit hobby kernel
+
+\hrule
+\vspace{1em}
+
+\tableofcontents
+\newpage
+
+%-----------------------------------------------------------------------
+\section{Project Overview}
+
+ElemOS is a 64-bit monolithic kernel written from scratch in C and x86-64 assembly. It boots via GRUB using the Multiboot2 protocol, runs under QEMU, and implements the core subsystems of a basic operating system: physical and virtual memory management, interrupt handling, preemptive multitasking, and an interactive shell.
+
+\begin{itemize}
+    \item \textbf{Codebase:} $\sim$3,000 lines of C, $\sim$400 lines of NASM assembly
+    \item \textbf{Target:} x86-64, freestanding, no libc
+    \item \textbf{Toolchain:} \texttt{x86\_64-elf-gcc}, \texttt{nasm}, \texttt{grub-mkrescue}, \texttt{xorriso}, \texttt{qemu-system-x86\_64}
+\end{itemize}
+
+Implemented subsystems, in initialization order:
+
+\begin{enumerate}
+    \item Multiboot2 boot header and GRUB handoff
+    \item 32-bit to 64-bit long mode transition (page tables, GDT, EFER MSR)
+    \item Global Descriptor Table (GDT)
+    \item Interrupt Descriptor Table (IDT) + ISR stubs
+    \item 8259 PIC remapping
+    \item VGA and serial (\texttt{kprintf})
+    \item Physical Memory Manager (PMM)
+    \item Virtual Memory Manager (VMM) / paging
+    \item Heap allocator (\texttt{kmalloc}/\texttt{kfree})
+    \item PS/2 keyboard driver
+    \item PIT-driven preemptive scheduler
+    \item Interactive shell process
+\end{enumerate}
+
+%-----------------------------------------------------------------------
+\section{Boot Sequence}
+
+\subsection{Multiboot2 and GRUB}
+
+The kernel image begins with a Multiboot2 header in a dedicated \texttt{.multiboot2} section, placed first in the linker script (\texttt{linker.ld}). GRUB requires the magic bytes within the first 8~KB of the image; any other ordering silently causes GRUB to skip the kernel without error.
+
+GRUB loads the kernel in 32-bit protected mode and passes a pointer to the Multiboot2 info structure in \texttt{ebx}. The boot code validates the magic number (\texttt{0x36d76289}) and stores the info pointer for later use by the PMM (to read the memory map tag).
+
+\subsection{Long Mode Transition}
+
+The entry point (\texttt{boot.asm}) performs the transition from 32-bit protected mode to 64-bit long mode before calling \texttt{kernel\_main}. Steps, in order:
+
+\begin{enumerate}
+    \item Verify CPUID support by testing EFLAGS bit 21.
+    \item Check for long-mode capability via \texttt{CPUID EAX=0x80000001} (LM bit in EDX).
+    \item Build identity-mapped page tables covering the first 8~MB: PML4 $\to$ PDPT $\to$ PD $\to$ PT chain allocated in BSS.
+    \item Load \texttt{cr3} with the PML4 address.
+    \item Set PAE in \texttt{cr4}, set LME in \texttt{IA32\_EFER} MSR, set PG in \texttt{cr0}.
+    \item Load a 64-bit GDT.
+    \item Far-jump to a 64-bit code segment, entering long mode.
+    \item Set up a 32~KB stack in BSS, then \texttt{call kernel\_main}.
+\end{enumerate}
+
+The kernel image links at physical address \texttt{0x100000} (1~MB, above BIOS/EBDA). The identity map covers 8~MB because the kernel image plus BSS (stack, page tables) exceeds 2~MB.
+
+%-----------------------------------------------------------------------
+\section{GDT and IDT}
+
+\subsection{GDT}
+
+The GDT contains four descriptors: null, 64-bit code, 64-bit data, and a TSS entry. The TSS is used only to define a valid RSP0 for future privilege-level transitions; no userspace exists yet.
+
+The GDT struct is declared \texttt{\_\_attribute\_\_((aligned(8)))}. The 10-byte \texttt{GDTR} passed to \texttt{lgdt} must also be aligned; misalignment causes a silent triple-fault on some CPU implementations.
+
+\subsection{IDT and ISR Stubs}
+
+\texttt{isr\_stubs.asm} defines 256 ISR entry points using a NASM macro. Each stub pushes a vector number (and a dummy error code for vectors that do not push one) and jumps to a common C handler, \texttt{isr\_handler}. The handler dispatches to registered function pointers stored in a 256-entry table.
+
+All ISRs save and restore the full register set (\texttt{rax}, \texttt{rbx}, \texttt{rcx}, \texttt{rdx}, \texttt{rsi}, \texttt{rdi}, \texttt{rbp}, \texttt{r8}--\texttt{r15}) on the kernel stack before entering C.
+
+\subsection{PIC Remap}
+
+The 8259A PIC defaults to mapping IRQ0--IRQ7 to interrupt vectors \texttt{0x08}--\texttt{0x0F}. In 64-bit mode, vectors \texttt{0x08} and \texttt{0x0D} are the double-fault and general-protection-fault handlers. To prevent hardware IRQs from triggering CPU exception handlers, the PIC is remapped to vectors \texttt{0x20}--\texttt{0x2F} before \texttt{sti} is executed.
+
+%-----------------------------------------------------------------------
+\section{Physical Memory Manager}
+
+The PMM uses a \textbf{bitmap allocator}: one bit per 4~KB physical page. For 256~MB of RAM, the bitmap is 8~KB.
+
+\textbf{Initialization:}
+The PMM walks the Multiboot2 memory map tag. It marks all pages in \texttt{MULTIBOOT\_MEMORY\_AVAILABLE} regions as free, then marks pages occupied by the kernel image (\texttt{\_kernel\_start}--\texttt{\_kernel\_end}, from the linker script) as used, then marks the bitmap's own pages as used.
+
+\textbf{Allocation:} \texttt{pmm\_alloc()} finds the first free bit, sets it, and returns the physical address (\texttt{bit\_index * 4096}).
+
+\textbf{Deallocation:} \texttt{pmm\_free()} clears the bit. No coalescing --- physical pages are fixed-size.
+
+%-----------------------------------------------------------------------
+\section{Virtual Memory Manager}
+
+The VMM operates on top of the identity-mapped 8~MB region established at boot. Its two responsibilities are:
+
+\begin{enumerate}
+    \item \textbf{Page table walk:} translate a virtual address to a physical address by traversing PML4 $\to$ PDPT $\to$ PD $\to$ PT.
+    \item \textbf{Map pages:} install a virtual$\to$physical mapping by allocating intermediate tables from the PMM as needed and writing page table entries with the appropriate flags (present, writable, etc.).
+\end{enumerate}
+
+The kernel runs entirely within the identity-mapped region. The VMM's map function is used only by \texttt{kmalloc} when expanding the heap past its initial committed range.
+
+Page faults are handled by a registered ISR that calls \texttt{kpanic()}. There is no demand paging or page-fault recovery; any fault is a kernel bug.
+
+%-----------------------------------------------------------------------
+\section{Heap Allocator (\texttt{kmalloc} / \texttt{kfree})}
+
+The heap allocator uses a \textbf{free-list of variable-size blocks}. Each block has a 16-byte header (size, flags, forward and backward pointers), followed by the user payload.
+
+\textbf{Allocation:} Walk the free list for a block of sufficient size. If the remaining space after allocation exceeds the minimum block size, split. Return a pointer to the payload.
+
+\textbf{Deallocation:} Mark the block free and coalesce with adjacent free blocks.
+
+\textbf{Integrity check:} \texttt{kmalloc\_verify()} walks the entire heap validating header consistency. Called in test scenarios only; not active at runtime.
+
+The heap starts at a fixed virtual address and grows via \texttt{vmm\_map()} + \texttt{pmm\_alloc()} in 4~KB increments.
+
+%-----------------------------------------------------------------------
+\section{Interrupt Handling and Drivers}
+
+\subsection{PIT (Preemptive Timer)}
+
+The PIT (8253/8254) is configured in mode 3 (square wave) with a divisor that produces approximately 100~Hz. IRQ0 fires the timer ISR, which increments a tick counter and calls \texttt{scheduler\_yield()}.
+
+\subsection{PS/2 Keyboard}
+
+The keyboard driver handles IRQ1 (PS/2 port). The ISR reads one scancode byte from port \texttt{0x60}, decodes it against a scancode set~1 lookup table, tracks modifier state (Shift, Caps Lock), and enqueues the resulting ASCII character in a small ring buffer. \texttt{keyboard\_getchar()} blocks by spinning on the buffer.
+
+EOI is sent to the PIC \textbf{after} reading the scancode. Sending EOI before reading leaves the byte in the keyboard's output buffer, which re-asserts IRQ1 on the next PIC cycle, producing an interrupt storm.
+
+%-----------------------------------------------------------------------
+\section{Scheduler and Context Switching}
+
+The scheduler is a \textbf{round-robin} over a fixed-size process table. Each process has a PCB (\texttt{struct process}) holding PID, state (READY/RUNNING/BLOCKED), a kernel stack, and a saved RSP.
+
+\subsection{Context Switch}
+
+\texttt{switch\_to(uint64\_t *old\_rsp\_ptr, uint64\_t new\_rsp)} in \texttt{switch.asm}:
+
+\begin{enumerate}
+    \item Push all callee-saved registers (\texttt{rbp}, \texttt{rbx}, \texttt{r12}--\texttt{r15}) on the outgoing process's stack.
+    \item Write current RSP into \texttt{*old\_rsp\_ptr}.
+    \item Load \texttt{new\_rsp} into RSP.
+    \item Pop the incoming process's callee-saved registers.
+    \item \texttt{ret} --- transfers control to wherever the incoming process last called \texttt{switch\_to} (or to the entry function for a new process).
+\end{enumerate}
+
+\subsection{New Process Stack Initialization}
+
+A process that has never run has no saved context. Its stack is fabricated to look like it was switched away from: six zeros (for the six callee-saved registers) followed by the process's entry function address. The first \texttt{switch\_to} call pops the zeros, hits \texttt{ret}, and enters the entry function.
+
+\subsection{Interrupts and Scheduling}
+
+\texttt{switch\_to} re-enables interrupts (\texttt{sti}) immediately before \texttt{ret}. When called from the timer ISR (IF=0), the incoming process would otherwise run with interrupts permanently disabled, causing \texttt{hlt} in the idle loop to freeze.
+
+%-----------------------------------------------------------------------
+\section{Shell}
+
+The shell runs as an ordinary kernel process. It loops: read a line from the keyboard buffer, tokenize on whitespace, dispatch on the first token.
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+\textbf{Command} & \textbf{Action} \\
+\midrule
+\texttt{help}  & Print available commands \\
+\texttt{clear} & Clear the VGA screen \\
+\texttt{mem}   & Print PMM statistics (free/used pages) \\
+\texttt{ps}    & Print process table (PID, state, name) \\
+\texttt{yield} & Explicitly yield CPU to scheduler \\
+\texttt{hello} & Print a test string \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+%-----------------------------------------------------------------------
+\section{Problems Encountered and Solutions}
+
+Each challenge below is described using the STAR format: \textbf{Situation} (the challenge encountered), \textbf{Task} (what was being implemented at the time), \textbf{Action} (what was done to resolve it), and \textbf{Result} (the outcome).
+
+\subsection{Toolchain Setup}
+
+\textbf{Situation:} The build environment was broken from the start. Compiling \texttt{x86\_64-elf-gcc} from source following the OSDev wiki guide failed during the libgcc build step, and a fallback attempt using the AUR package produced object files that were incompatible with artifacts leftover from the failed source build.
+
+\textbf{Task:} The goal was to set up a working freestanding cross-compilation toolchain capable of producing a bare-metal x86-64 ELF kernel image --- a prerequisite before any kernel code could be compiled or linked.
+
+\textbf{Action:} All build artifacts from previous attempts were cleared. The full toolchain was then installed directly from the Arch Linux official repositories: \texttt{x86\_64-elf-gcc}, \texttt{nasm}, \texttt{binutils}, \texttt{grub}, \texttt{libisoburn}, \texttt{xorriso}, \texttt{qemu}, and \texttt{gdb}. The exact package list was recorded in the README.
+
+\textbf{Result:} The toolchain compiled and linked the kernel image correctly on the first attempt. Distro-packaged cross-compilers proved sufficient for a freestanding target, and the documented package list ensures the setup does not need to be repeated.
+
+\subsection{Multiboot2 Header Placement}
+
+\textbf{Situation:} GRUB silently refused to boot the kernel with no error output --- the boot menu simply fell through to a ``no bootable kernel found'' message, providing no diagnostic information.
+
+\textbf{Task:} The kernel was being wired up to GRUB using the Multiboot1 protocol. The linker script needed to place the Multiboot header in the correct location within the binary so GRUB could find it during the boot scan.
+
+\textbf{Action:} Investigation revealed that the Multiboot1 header had been placed after the \texttt{.text} section, pushing it beyond the 8~KB boundary that GRUB scans. The protocol was upgraded to Multiboot2, and the \texttt{.multiboot2} section was moved to the very first position in \texttt{linker.ld}. An immediate VGA write to \texttt{0xB8000} was added as the first kernel instruction to visually confirm a successful GRUB handoff.
+
+\textbf{Result:} GRUB successfully loaded and launched the kernel. The VGA confirmation character appeared on screen, verifying that control had been transferred correctly.
+
+\subsection{Identity Map Too Small}
+
+\textbf{Situation:} The kernel triple-faulted on the first memory access past physical address \texttt{0x200000} immediately after entering 64-bit long mode, with no error output or diagnostic information.
+
+\textbf{Task:} During the long-mode transition in \texttt{boot.asm}, identity-mapped page tables were being constructed to cover the kernel's physical memory range so that virtual addresses equalled physical addresses until higher-level memory management was established.
+
+\textbf{Action:} The root cause was traced to the identity map covering only 2~MB, while the kernel image combined with BSS (stack and page table storage) exceeded that boundary. With the IDT not yet installed, the resulting page fault escalated directly to a triple-fault. Additional PT entries were added to \texttt{boot.asm} to extend the identity map to 8~MB.
+
+\textbf{Result:} The kernel booted through the long-mode transition without faulting, and all subsequent memory accesses within the mapped region succeeded.
+
+\subsection{GDT Alignment Triple-Fault}
+
+\textbf{Situation:} The CPU triple-faulted on the instruction immediately following a seemingly successful \texttt{lgdt} call. No register corruption or other anomaly was visible before the fault.
+
+\textbf{Task:} The GDT was being installed as part of the 64-bit environment setup in \texttt{kernel\_main}, required to define valid code and data segments before the kernel could execute C code reliably.
+
+\textbf{Action:} After ruling out descriptor content errors, the GDT struct was annotated with \texttt{\_\_attribute\_\_((aligned(8)))}. The Intel SDM notes that the processor requires the 10-byte \texttt{GDTR} operand itself to be properly aligned in memory when loaded; without this, certain CPU implementations triple-fault silently.
+
+\textbf{Result:} The \texttt{lgdt} completed without fault and the CPU transitioned cleanly to using the new GDT, allowing \texttt{kernel\_main} to proceed.
+
+\subsection{\texttt{sti} Before PIC Remap}
+
+\textbf{Situation:} The kernel triple-faulted immediately upon enabling interrupts with \texttt{sti}, before any hardware event could have been processed.
+
+\textbf{Task:} Interrupt handling was being enabled in \texttt{kernel\_main} after the IDT was populated, as part of bringing up the system's interrupt infrastructure.
+
+\textbf{Action:} The cause was an incorrect initialization order: \texttt{sti} was called before \texttt{pic\_remap()}. The 8259A PIC's default mapping places IRQ0 at vector \texttt{0x08}, which is the CPU's double-fault handler in 64-bit mode. The first timer tick therefore triggered a spurious double-fault before the IDT handler for that vector was set. The fix was to call \texttt{pic\_remap()} --- which moves hardware IRQs to vectors \texttt{0x20}--\texttt{0x2F} --- before executing \texttt{sti}.
+
+\textbf{Result:} Interrupts were enabled without faulting, and subsequent timer and keyboard IRQs were delivered to the correct ISR entries.
+
+\subsection{PMM Allocating Its Own Bitmap}
+
+\textbf{Situation:} The first call to \texttt{pmm\_alloc()} returned a physical address that fell inside the PMM's own bitmap buffer. Subsequent allocations produced duplicate or overlapping pointers, eventually corrupting the entire free-page accounting.
+
+\textbf{Task:} The Physical Memory Manager was being initialized to manage all available RAM, reading the Multiboot2 memory map to identify free regions and building a bitmap to track page availability.
+
+\textbf{Action:} The PMM initialization code marked kernel image pages as used but neglected to also mark the bitmap's own pages. An explicit step was added at the end of PMM initialization to mark all pages occupied by the bitmap itself as used before the allocator was made available to callers.
+
+\textbf{Result:} \texttt{pmm\_alloc()} returned only pages outside both the kernel image and the bitmap, and no allocation corruption occurred in subsequent testing.
+
+\subsection{\texttt{kmalloc} Header Size Mismatch}
+
+\textbf{Situation:} \texttt{kmalloc(32)} returned a pointer with only 8 usable bytes before overlapping the next block header, causing silent heap corruption on any allocation larger than that.
+
+\textbf{Task:} The heap allocator was being implemented with a 16-byte block header (size, flags, forward and backward pointers) prepended to each allocation, with the user pointer offset by exactly \texttt{sizeof(header)} bytes.
+
+\textbf{Action:} Inspection revealed that the compiler had padded the header struct to 24 bytes due to implicit alignment, while the allocator assumed 16. The struct was declared \texttt{\_\_attribute\_\_((packed))} with all fields given explicit fixed-width types, forcing a guaranteed 16-byte layout.
+
+\textbf{Result:} \texttt{kmalloc(32)} correctly returned 32 usable bytes, and header boundaries aligned with actual block boundaries throughout the heap.
+
+\subsection{Heap Coalescing Off-By-One}
+
+\textbf{Situation:} Under sustained allocation and deallocation, the heap slowly corrupted over time. Live allocations were occasionally merged into adjacent free blocks, producing dangling pointers for their original owners.
+
+\textbf{Task:} The \texttt{kfree} function was being implemented with a coalescing step that merges a freed block with its immediate neighbours to reduce fragmentation.
+
+\textbf{Action:} The coalescing code contained an off-by-one error in the pointer arithmetic used to locate the next block's header, causing it to read the ``free'' flag from the wrong offset and occasionally treating an in-use block as free. The offset was corrected, and \texttt{kmalloc\_verify()} --- a full heap-walk integrity checker --- was added to detect this class of error during testing.
+
+\textbf{Result:} Heap corruption ceased under repeated alloc/free cycles. \texttt{kmalloc\_verify()} confirmed consistent header state across the entire heap after each test run.
+
+\subsection{New Process Stack Register Order}
+
+\textbf{Situation:} Every newly created process triple-faulted on its very first execution, before executing a single instruction of its own code.
+
+\textbf{Task:} The scheduler was being extended to support spawning new processes. Since a new process has never run before and has no saved context, its kernel stack must be fabricated to look as though it was previously context-switched away from, so that \texttt{switch\_to} can resume it cleanly.
+
+\textbf{Action:} The fabricated stack had the six callee-saved registers pushed in the wrong order. Because \texttt{switch\_to} pops them in reverse push order, it loaded garbage values into the registers and then issued \texttt{ret} to address \texttt{0x0}, causing the fault. The push order in the stack-fabrication code was corrected to match the pop order expected by \texttt{switch\_to}, and the required ordering was documented with a comment in \texttt{switch.asm}.
+
+\textbf{Result:} New processes launched correctly, with \texttt{switch\_to} restoring clean register state and transferring control to the intended entry function.
+
+\subsection{Keyboard EOI Ordering}
+
+\textbf{Situation:} After the very first keypress, the kernel entered a continuous interrupt storm: IRQ1 fired repeatedly at maximum rate, starving all other work and making the system unresponsive.
+
+\textbf{Task:} The PS/2 keyboard ISR was being implemented to read a scancode from port \texttt{0x60} on each IRQ1, decode it, and enqueue the resulting character. The ISR also needed to send an End-of-Interrupt (EOI) signal to the PIC to re-arm the interrupt line.
+
+\textbf{Action:} The root cause was that EOI was sent to the PIC before the scancode byte was read from port \texttt{0x60}. With the byte still sitting in the keyboard controller's output buffer, the controller re-asserted the IRQ line immediately on the next PIC cycle, producing an infinite stream of interrupts. The EOI write was moved to after the \texttt{inb(0x60)} call.
+
+\textbf{Result:} Each keypress produced exactly one interrupt. The kernel processed keypresses correctly and remained responsive to other tasks between keystrokes.
+
+\end{document}
